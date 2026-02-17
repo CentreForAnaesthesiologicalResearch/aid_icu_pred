@@ -61,12 +61,14 @@ df <- dfRaw |>
   ),
   mort_1y = case_when(
     fu2_dead1year == T ~ 1,
-    T ~ 0
+    fu2_dead1year == F ~ 0,
+    T ~ NA
   ),
   mort_1y = factor(mort_1y, levels = c(0,1)),
   mort_90d = case_when(
     prim_90mort == T ~ 1,
-    T ~ 0),
+    prim_90mort == F ~ 0,
+    T ~ NA),
   mort_90d = factor(mort_90d, levels = c(0,1)),
   sms = as.numeric(sms),
   icu_type = case_when(
@@ -100,6 +102,7 @@ df <- dfRaw |>
     .ptype = factor(levels = c('SMSlow', 'SMShigh'))
   )
   ) |>
+  filter(!is.na(mort_1y)) %>%
   # select columns used in the study
   dplyr::select(mort_1y, sex, age, alcohol_abuse, strata_delir, advanced_cancer, surgery, sms, icu_type, pre_barthel, pre_cps, pre_cfs, limitation, intervention)
 
@@ -119,7 +122,7 @@ basic_formula <- mort_1y ~ .
 
 pred_1ym_recpie <- recipe(basic_formula, data = df) |>
   # Update levels in the outcome
-  step_relevel(mort_1y, ref_level = "1") |>
+  step_relevel(mort_1y, ref_level = "1", skip = T) |>
   # Create rules to use multiple imputation
   step_impute_knn(all_predictors()) |>
   # normalize predictors
@@ -276,7 +279,7 @@ metrics <- metric_set(accuracy,
                       oe,
                       cals,
                       cali
-                        )
+)
 
 ### add workflows to workflow sets
 all_workflows <- 
@@ -338,7 +341,7 @@ all_workflows <-
     resamples = folds,
     verbose = TRUE,
     control = ctrl_grid
-    )
+  )
 
 tictoc::toc()
 
@@ -639,23 +642,52 @@ bootstrap_metrics <-
                                             extract = function (x) extract_fit_parsnip(x),
                                             parallel_over = 'resamples',
                                             save_workflow = T)
-                )
+  )
 tictoc::toc()
 
 ### extract final model
 final_model <- bootstrap_metrics$.extracts[[1]]$.extracts[[1]]
-
+final_wf_fit <- fit(bootstrap_en_wflow, data = df)
 final_model_tidy <- bootstrap_metrics$.extracts[[1]]$.extracts[[1]] |> tidy()
 
 saveRDS(final_model, file = 'results/1ym/model_training/final_model/final_model.rds')
-
+saveRDS(final_wf_fit, file = 'results/1ym/model_training/final_model/final_wf_fit.rds')
 saveRDS(final_model_tidy, file = 'results/1ym/model_training/final_model/final_model_tidy.rds')
 
 ### extract performance metrics on models trained on bootstrapped resamples
-bootstrapValMetrics <- bootstrap_metrics |>
-  dplyr::select(id, .metrics) |>
-  unnest(cols = .metrics) |>
-  dplyr::select(-c(.estimator, .config)) |>
+my_metrics <- metrics  
+
+
+bootstrapValMetrics <- boots |>
+  transmute(
+    id,
+    analysis_data = map(splits, analysis),
+    metrics = map(analysis_data, function(d) {
+      
+      pred_prob  <- predict(final_wf_fit, new_data = d, type = "prob")
+      pred_class <- predict(final_wf_fit, new_data = d, type = "class")
+      
+      truth_fix <- factor(d$mort_1y, levels = levels(pred_class$.pred_class))
+      
+      event_class <- levels(truth_fix)[1]
+      prob_col <- paste0(".pred_", event_class)
+      
+      res <- bind_cols(pred_prob, pred_class, truth = truth_fix)
+      
+      res$.pred_event <- res[[prob_col]]
+      
+      my_metrics(
+        res,
+        truth = truth,
+        estimate = .pred_class,
+        .pred_event,
+        event_level = "first"
+      )
+    })
+  ) |>
+  select(id, metrics) |>
+  unnest(metrics) |>
+  dplyr::select(-c(.estimator)) |>
   pivot_wider(names_from = .metric, values_from = .estimate) |>
   # Re-add the 1 substracted during deffination for optimizations towards 0
   mutate(oe = oe + 1,
@@ -694,8 +726,43 @@ bootstrap_predictions_original_df <- extracted_boots_models |>
 saveRDS(bootstrap_predictions_original_df, file = 'results/1ym/model_training/bootstrapped_results/bootstrap_predictions_original_df.rds')
 
 ### apparent performance
-apparent_performance <- bootstrapValMetrics |>
+apparent_performance_tmp <- bootstrapValMetrics |>
   filter(id == 'Apparent')
+
+alpha <- 0.05
+
+apparent_ci <- bootstrapValMetrics |>
+  dplyr::filter(id != "Apparent") |>
+  dplyr::summarise(dplyr::across(
+    where(is.numeric),
+    list(
+      lo = ~ quantile(.x, probs = alpha/2, na.rm = TRUE),
+      hi = ~ quantile(.x, probs = 1-alpha/2,, na.rm = TRUE)
+    ),
+    .names = "{.col}_{.fn}"
+  ))
+
+reorder_by_suffix <- function(.data, codes = c("lo", "hi")) {
+  nm <- names(.data)
+  rx <- paste0("(_", paste(codes, collapse = "|_"), ")$")
+  
+  key <- tibble(name = nm) |>
+    mutate(
+      base = str_replace(name, rx, ""),
+      suf  = str_extract(name, rx),
+      suf  = replace_na(suf, "")
+    ) |>
+    mutate(suf = factor(suf, levels = c("", paste0("_", codes)))) |>
+    arrange(base, suf) |>
+    pull(name)
+  
+  select(.data, all_of(key))
+}
+
+combined_apparent <- bind_cols(apparent_performance_tmp, apparent_ci)
+
+apparent_performance <- reorder_by_suffix(combined_apparent, codes = c("lo","hi")) |>
+  select(id, accuracy, accuracy_lo, accuracy_hi, bal_accuracy, bal_accuracy_lo, bal_accuracy_hi, brier_class, brier_class_lo, brier_class_hi, cali, cali_lo, cali_hi, cals, cals_lo, cals_hi, csr2, csr2_lo, csr2_hi, oe, oe_lo, oe_hi, pr_auc, pr_auc_lo, pr_auc_hi, roc_auc, roc_auc_lo, roc_auc_hi)
 
 saveRDS(apparent_performance, file = 'results/1ym/model_training/final_performance/apparent_performance.rds')
 
@@ -728,14 +795,32 @@ optimism_adjused_performance <- apparent_performance |>
   mutate(
     id = 'Optimism adjusted',
     accuracy = accuracy - mean(optimism_df$accuracy_optimism),
+    accuracy_lo = accuracy_lo - mean(optimism_df$accuracy_optimism),
+    accuracy_hi = accuracy_hi - mean(optimism_df$accuracy_optimism), 
     roc_auc = roc_auc - mean(optimism_df$roc_auc_optimism),
+    roc_auc_lo = roc_auc_lo - mean(optimism_df$roc_auc_optimism),
+    roc_auc_hi = roc_auc_hi - mean(optimism_df$roc_auc_optimism),
     brier_class = brier_class - mean(optimism_df$brier_class_optimism),
+    brier_class_lo = brier_class_lo - mean(optimism_df$brier_class_optimism),
+    brier_class_hi = brier_class_hi - mean(optimism_df$brier_class_optimism),
     bal_accuracy = bal_accuracy - mean(optimism_df$bal_accuracy_optimism),
+    bal_accuracy_lo = bal_accuracy_lo - mean(optimism_df$bal_accuracy_optimism),
+    bal_accuracy_hi = bal_accuracy_hi - mean(optimism_df$bal_accuracy_optimism),
     pr_auc = pr_auc - mean(optimism_df$pr_auc_optimism),
+    pr_auc_lo = pr_auc_lo - mean(optimism_df$pr_auc_optimism),
+    pr_auc_hi = pr_auc_hi - mean(optimism_df$pr_auc_optimism),
     csr2 = csr2 - mean(optimism_df$csr2_optimism),
+    csr2_lo = csr2_lo - mean(optimism_df$csr2_optimism),
+    csr2_hi = csr2_hi - mean(optimism_df$csr2_optimism),
     oe = oe - mean(optimism_df$oe_optimism),
+    oe_lo = oe_lo - mean(optimism_df$oe_optimism),
+    oe_hi = oe_hi - mean(optimism_df$oe_optimism),
     cals = cals - mean(optimism_df$cals_optimism),
-    cali = cali - mean(optimism_df$cali_optimism)
+    cals_lo = cals_lo - mean(optimism_df$cals_optimism),
+    cals_hi = cals_hi - mean(optimism_df$cals_optimism),
+    cali = cali - mean(optimism_df$cali_optimism),
+    cali_lo = cali_lo - mean(optimism_df$cali_optimism),
+    cali_hi = cali_hi - mean(optimism_df$cali_optimism)
   )
 
 saveRDS(optimism_adjused_performance, file = 'results/1ym/model_training/final_performance/optimism_adjusted_performance.rds')
@@ -743,7 +828,36 @@ saveRDS(optimism_adjused_performance, file = 'results/1ym/model_training/final_p
 ### Write model performance csv
 model_performance <- rbind(apparent_performance, optimism_adjused_performance)
 
+format_ci_table <- function(df, id_col = "id", digits = 3, drop_lo_hi = TRUE) {
+  
+  metric_cols <- names(df) |>
+    setdiff(id_col) |>
+    keep(~ !str_detect(.x, "_lo$|_hi$")) |>
+    keep(~ paste0(.x, "_lo") %in% names(df) && paste0(.x, "_hi") %in% names(df))
+  
+  fmt <- paste0("%.", digits, "f (%.", digits, "f-%.", digits, "f)")
+  
+  for (m in metric_cols) {
+    df[[m]] <- sprintf(
+      fmt,
+      as.numeric(df[[m]]),
+      as.numeric(df[[paste0(m, "_lo")]]),
+      as.numeric(df[[paste0(m, "_hi")]])
+    )
+  }
+  
+  if (drop_lo_hi) {
+    df <- df |> select(-ends_with("_lo"), -ends_with("_hi"))
+  }
+  
+  df
+}
+
+model_performance_export <- format_ci_table(model_performance, id_col = "id", digits = 3, drop_lo_hi = TRUE)
+
 write_csv2(model_performance, file = 'results/1ym/model_training/final_performance/combined_performance.csv')
+write_csv2(model_performance_export, file = 'results/1ym/model_training/final_performance/combined_performance_export.csv')
+
 
 ### produce optimism plots
 accuracy_optimism_plot <- optimism_df |>
@@ -891,7 +1005,7 @@ cali_optimism_plot <- optimism_df |>
   geom_vline(xintercept = mean(optimism_df$cali_optimism), color = 'blue') + 
   theme_light() +
   labs(
-    title = "Calibration interceptt optimism plot",
+    title = "Calibration intercept optimism plot",
     x = "Estimated optimism of calibration intercept",
     y = "Count"
   ) +
@@ -923,32 +1037,84 @@ for (name in names(list_optimism_plots)) {
 
 
 # create calibration curves -----------------------------------------------
-calibration_df <- bootstrap_metrics |>
-  dplyr::select(id, .predictions) |>
-  unnest(.predictions) |>
-  dplyr::select(id, .pred_1, mort_1y) |>
-  mutate(group = ifelse(id == "Apparent", "apparent", "bootstrapped"),
-         mort_1y = case_when(
-           mort_1y == 0 ~ 0,
-           mort_1y == 1 ~ 1,
-           .ptype = numeric()
-         )) 
+bootstrap_resamples <-
+  bootstrap_en_wflow |>
+  fit_resamples(
+    resamples = boots,
+    metrics   = metrics,
+    control   = control_resamples(
+      save_pred = TRUE,
+      extract   = function(x) x,
+      parallel_over = "resamples",
+      save_workflow = TRUE
+    )
+  )
 
-cal_bootstrapped <- subset(calibration_df, group == "bootstrapped")
-cal_apparent <- subset(calibration_df, group == "apparent")
+boot_wflows <- bootstrap_resamples |>
+  filter(id != "Apparent") |>
+  select(id, .extracts) |>
+  unnest(.extracts) |>
+  rename(wflow_fit = .extracts) |>
+  inner_join(boots |> select(id, splits), by = "id")
+
+event_class <- "1"  
+
+cal_bootstrapped <- boot_wflows |>
+  transmute(
+    id,
+    analysis_data = map(splits, analysis),
+    preds = map2(wflow_fit, analysis_data, function(wf, dat) {
+      
+      p_prob  <- predict(wf, new_data = dat, type = "prob")
+      p_class <- predict(wf, new_data = dat, type = "class")
+      
+      truth_num <- as.integer(as.character(dat$mort_1y))
+      
+      prob_col <- paste0(".pred_", event_class)
+      if (!prob_col %in% names(p_prob)) {
+        stop("Probability column ", prob_col, " not found. Available: ",
+             paste(names(p_prob), collapse = ", "))
+      }
+      
+      out <- bind_cols(
+        p_prob,
+        p_class,
+        mort_1y = truth_num
+      )
+      
+      out$.pred_event <- out[[prob_col]]
+      
+      out
+    })
+  ) |>
+  select(id, preds) |>
+  unnest(preds) |>
+  mutate(group = "bootstrapped_analysis") |>
+  select(id, group, .pred_event, mort_1y)
+
+cal_apparent <- bootstrap_metrics |>
+  select(id, .predictions) |>
+  unnest(.predictions) |>
+  filter(id == "Apparent") |>
+  transmute(
+    id,
+    group = "apparent",
+    .pred_1,
+    mort_1y = as.numeric(as.character(mort_1y))
+  )
 
 cal_plot <- ggplot() +
   geom_smooth(
-              data   = cal_bootstrapped,
-              aes(x = .pred_1, y = mort_1y, group = id),
-              method      = "gam",
-              formula     = y ~ s(x, bs = "cs", k = 5),
-              method.args = list(family = gaussian),
-              se     = FALSE,
-              color  = "grey",
-              size   = 0.1,
-              alpha  = 0.3
-              ) +
+    data   = cal_bootstrapped,
+    aes(x = .pred_event, y = mort_1y, group = id),
+    method      = "gam",
+    formula     = y ~ s(x, bs = "cs", k = 5),
+    method.args = list(family = gaussian),
+    se     = FALSE,
+    color  = "grey",
+    size   = 0.1,
+    alpha  = 0.3
+  ) +
   geom_smooth(
     data        = cal_apparent,
     aes(x = .pred_1, y = mort_1y, group = 1),
@@ -1028,7 +1194,7 @@ shap_importance <- sv_importance(sv) +
     'pre_barthel' = 'Barthel index',
     'icu_type_tertiary' = 'Teritary intensive care unit',
     'strata_delir_Hypo' = 'Hypoactive delirium'
-    ))
+  ))
 shap_bee_importance_plot <- sv_importance(sv, kind = "bee", show_numbers = TRUE, alpha = 0.3)  +
   scale_y_discrete(labels = c(
     'age' = 'Age',
@@ -1082,26 +1248,26 @@ write_rds(scaling_values, 'results/1ym/model_training/final_model/scaling_values
 subgroup_df <- baked_df |>
   mutate(
     barthel_category = case_when(
-      dfRaw$Pre_Barthel >= 17 ~ 'BarthelHigh',
-      dfRaw$Pre_Barthel <= 16 ~ 'BarthelLow',
+      df$pre_barthel >= 17 ~ 'BarthelHigh',
+      df$pre_barthel <= 16 ~ 'BarthelLow',
       T ~ NA,
       .ptype = factor(levels = c('BarthelHigh','BarthelLow'))
     ),
     cfs_category = case_when(
-      dfRaw$Pre_CFS <= 4 ~ 'CFSLow',
-      dfRaw$Pre_CFS >= 5 ~ 'CFSHigh',
+      df$pre_cfs <= 4 ~ 'CFSLow',
+      df$pre_cfs >= 5 ~ 'CFSHigh',
       T ~ NA,
       .ptype = factor(levels = c('CFSLow', 'CFSHigh'))
     ),
     cps_category = case_when(
-      dfRaw$Pre_CPS <= 13 ~ 'CPSLow',
-      dfRaw$Pre_CPS >= 14 ~ 'CPSHigh',
+      df$pre_cps <= 13 ~ 'CPSLow',
+      df$pre_cps >= 14 ~ 'CPSHigh',
       T ~ NA,
       .ptype = factor(levels = c('CPSLow', 'CPSHigh'))
     ),
     sms_category = case_when(
-      dfRaw$sms <= 25 ~ 'SMSlow',
-      dfRaw$sms >= 26 ~ 'SMShigh',
+      df$sms <= 25 ~ 'SMSlow',
+      df$sms >= 26 ~ 'SMShigh',
       T ~ NA,
       .ptype = factor(levels = c('SMSlow', 'SMShigh'))
     )
@@ -1115,60 +1281,6 @@ subgroup_counts <- purrr::map_dfr(subgroup_vars, function(var) {
     count(subgroup_level, name = "n") |>
     mutate(subgroup_var = var)
 })
-
-
-bootstrap_predictions_subgroups_df <- extracted_boots_models |>
-  mutate(
-    pred_prob = map(model, ~ predict(.x, new_data = subgroup_df, type = 'prob')),
-    pred_class = map(model, ~ predict(.x, new_data = subgroup_df, type = 'class')),
-    truth = list(subgroup_df$mort_1y),
-    subgroups = list(subgroup_df |> dplyr::select(all_of(subgroup_vars)))
-  ) |>
-  mutate(
-    results = pmap(list(pred_prob, pred_class, truth, subgroups), 
-                   ~ bind_cols(..1, .pred_class = ..2, truth = ..3, ..4))
-  )
-
-subgroup_results_long <- purrr::map_dfr(subgroup_vars, function(var) {
-  bootstrap_predictions_subgroups_df |>
-    mutate(
-      metrics = map(results, ~ {
-        .x |>
-          mutate("{var}" := as.character(.data[[var]])) |>  
-          group_by(.data[[var]]) |>  
-          metrics(
-            truth = truth,
-            estimate = .pred_class,
-            .pred_1,
-            event_level = "first"
-          ) |>
-          ungroup() |>
-          mutate(across(.estimate, as.numeric)) |>
-          mutate(across(where(is.factor), as.character)) |>
-          tibble::as_tibble()
-      }),
-      subgroup_var = var
-    ) |>
-    unnest(cols = metrics) |>
-    mutate(across(where(is.factor), as.character))
-}) |>
-  dplyr::select(-c(model, pred_prob, pred_class, truth, subgroups, results))
-
-subgroup_results <- subgroup_results_long |>
-  mutate(subgroup_level = case_when(
-    !is.na(barthel_category) ~ barthel_category, 
-    !is.na(cfs_category) ~ cfs_category, 
-    !is.na(cps_category) ~ cps_category, 
-    !is.na(sms_category) ~ sms_category,
-    T ~ NA
-    )
-  ) |>
-  dplyr::select(-c(barthel_category, cfs_category, cps_category, sms_category)) |>
-  pivot_wider(
-    names_from = .metric,
-    values_from = .estimate
-  )  |>
-  dplyr::select(-c(`.estimator`))
 
 apparent_predictions_subgroups_df <- tibble(
   model = list(final_model),
@@ -1207,40 +1319,191 @@ apparent_subgroup_results_long <- purrr::map_dfr(subgroup_vars, function(var) {
 }) |>
   dplyr::select(-c(model, pred_prob, pred_class, truth, subgroups, results))
 
-apparent_subgroup_results <- apparent_subgroup_results_long |>
-  mutate(subgroup_level = case_when(
-    !is.na(barthel_category) ~ barthel_category, 
-    !is.na(cfs_category) ~ cfs_category, 
-    !is.na(cps_category) ~ cps_category, 
-    !is.na(sms_category) ~ sms_category,
-    T ~ NA
+B <- 500
+
+boots_sub <- rsample::bootstraps(subgroup_df, times = B)
+
+boot_subgroup_metrics_long <- purrr::map_dfr(subgroup_vars, function(var) {
+  
+  purrr::map_dfr(boots_sub$splits, function(spl) {
+    set.seed(1)
+    d_boot <- rsample::analysis(spl)
+    
+    pred_prob  <- predict(final_model, new_data = d_boot, type = "prob")
+    pred_class <- predict(final_model, new_data = d_boot, type = "class")
+    
+    res <- bind_cols(
+      pred_prob,
+      .pred_class = pred_class,
+      truth = d_boot$mort_1y,
+      d_boot |> dplyr::select(all_of(subgroup_vars))
+    ) |>
+      mutate("{var}" := as.character(.data[[var]])) |>
+      group_by(.data[[var]]) |>
+      metrics(
+        truth = truth,
+        estimate = .pred_class,
+        .pred_1,
+        event_level = "first"
+      ) |>
+      ungroup() |>
+      mutate(subgroup_var = var) |>
+      rename(subgroup_level = !!var)
+    
+    res
+  })
+  
+})
+
+boot_subgroup_ci_long <- boot_subgroup_metrics_long |>
+  group_by(subgroup_var, subgroup_level, .metric) |>
+  summarise(
+    estimate_lo = quantile(.estimate, probs = alpha/2, na.rm = TRUE),
+    estimate_hi = quantile(.estimate, probs = 1 - alpha/2, na.rm = TRUE),
+    .groups = "drop"
   )
+
+apparent_subgroup_point_long <- apparent_subgroup_results_long |>
+  mutate(
+    subgroup_level = case_when(
+      subgroup_var == "barthel_category" ~ as.character(barthel_category),
+      subgroup_var == "cfs_category"     ~ as.character(cfs_category),
+      subgroup_var == "cps_category"     ~ as.character(cps_category),
+      subgroup_var == "sms_category"     ~ as.character(sms_category),
+      T ~ NA
+    )
   ) |>
-  dplyr::select(-c(barthel_category, cfs_category, cps_category, sms_category)) |>
+  select(subgroup_var, subgroup_level, .metric, .estimate)
+
+apparent_subgroup_with_ci_long <- apparent_subgroup_point_long |>
+  left_join(boot_subgroup_ci_long,
+            by = c("subgroup_var", "subgroup_level", ".metric"))
+
+apparent_subgroup_with_ci_wide <- apparent_subgroup_with_ci_long |>
+  rename(estimate = .estimate) |>
+  pivot_longer(
+    cols = c(estimate, estimate_lo, estimate_hi),
+    names_to = "which",
+    values_to = "value"
+  ) |>
+  mutate(
+    suffix = case_when(
+      which == "estimate"    ~ "",
+      which == "estimate_lo" ~ "_lo",
+      which == "estimate_hi" ~ "_hi"
+    ),
+    out_name = paste0(.metric, suffix)
+  ) |>
+  select(-which, -suffix, -.metric) |>
   pivot_wider(
-    names_from = .metric,
-    values_from = .estimate
+    names_from = out_name,
+    values_from = value
   ) |>
-  dplyr::select(-c(`.estimator`)) |>
-  mutate(performance = 'apparent')
+  mutate(
+    oe   = oe + 1,
+    oe_lo = oe_lo + 1,
+    oe_hi = oe_hi + 1,
+    cals   = cals + 1,
+    cals_lo = cals_lo + 1,
+    cals_hi = cals_hi + 1
+  )
 
-common_keys <- c("subgroup_var", "subgroup_level")
+estimator_cols <- paste(names(apparent_subgroup_with_ci_wide |>
+                                select(-c(subgroup_level, subgroup_var))))
 
-subgroup_boot_means <- subgroup_results |>
-  group_by(across(all_of(common_keys))) |>
-  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop") |>
-  left_join(subgroup_counts, by = c("subgroup_var", "subgroup_level"))
-
-
-subgroup_joined <- apparent_subgroup_results |>
-  left_join(subgroup_boot_means, by = common_keys, suffix = c("_apparent", "_bootstrap"))
-
-performance_subgroup_combined <- subgroup_joined |>
-  mutate(across(
-    ends_with("_apparent"),
-    ~ .x - (get(sub("\\_apparent$", "_bootstrap", cur_column())) - .x),
-    .names = "{.col}_optimism_adjusted"
-  )) |>
+subgroup_results <- apparent_subgroup_with_ci_wide |>
+  left_join(subgroup_counts, by = c("subgroup_var", "subgroup_level")) |>
+  rename_with(~ paste0(.x, "_apparent"), all_of(estimator_cols)) |>
+  mutate(
+    accuracy_optimism_adjusted = accuracy_apparent - mean(optimism_df$accuracy_optimism),
+    accuracy_lo_optimism_adjusted = accuracy_lo_apparent - mean(optimism_df$accuracy_optimism),
+    accuracy_hi_optimism_adjusted = accuracy_hi_apparent - mean(optimism_df$accuracy_optimism),
+    
+    roc_auc_optimism_adjusted = roc_auc_apparent - mean(optimism_df$roc_auc_optimism),
+    roc_auc_lo_optimism_adjusted = roc_auc_lo_apparent - mean(optimism_df$roc_auc_optimism),
+    roc_auc_hi_optimism_adjusted = roc_auc_hi_apparent - mean(optimism_df$roc_auc_optimism),
+    
+    
+    brier_class_optimism_adjusted = brier_class_apparent - mean(optimism_df$brier_class_optimism),
+    brier_class_lo_optimism_adjusted = brier_class_lo_apparent - mean(optimism_df$brier_class_optimism),
+    brier_class_hi_optimism_adjusted = brier_class_hi_apparent - mean(optimism_df$brier_class_optimism),
+    
+    bal_accuracy_optimism_adjusted = bal_accuracy_apparent - mean(optimism_df$bal_accuracy_optimism),
+    bal_accuracy_lo_optimism_adjusted = bal_accuracy_lo_apparent - mean(optimism_df$bal_accuracy_optimism),
+    bal_accuracy_hi_optimism_adjusted = bal_accuracy_hi_apparent - mean(optimism_df$bal_accuracy_optimism),
+    
+    
+    pr_auc_optimism_adjusted = pr_auc_apparent - mean(optimism_df$pr_auc_optimism),
+    pr_auc_lo_optimism_adjusted = pr_auc_lo_apparent - mean(optimism_df$pr_auc_optimism),
+    pr_auc_hi_optimism_adjusted = pr_auc_hi_apparent - mean(optimism_df$pr_auc_optimism),
+    
+    csr2_optimism_adjusted = csr2_apparent - mean(optimism_df$csr2_optimism),
+    csr2_lo_optimism_adjusted = csr2_lo_apparent - mean(optimism_df$csr2_optimism),
+    csr2_hi_optimism_adjusted = csr2_hi_apparent - mean(optimism_df$csr2_optimism),
+    
+    oe_optimism_adjusted = oe_apparent - mean(optimism_df$oe_optimism),
+    oe_lo_optimism_adjusted = oe_lo_apparent - mean(optimism_df$oe_optimism),
+    oe_hi_optimism_adjusted = oe_hi_apparent - mean(optimism_df$oe_optimism),
+    
+    cals_optimism_adjusted = cals_apparent - mean(optimism_df$cals_optimism),
+    cals_lo_optimism_adjusted = cals_lo_apparent - mean(optimism_df$cals_optimism),
+    cals_hi_optimism_adjusted = cals_hi_apparent - mean(optimism_df$cals_optimism),
+    
+    cali_optimism_adjusted = cali_apparent - mean(optimism_df$cali_optimism),
+    cali_lo_optimism_adjusted = cali_lo_apparent - mean(optimism_df$cali_optimism),
+    cali_hi_optimism_adjusted = cali_hi_apparent - mean(optimism_df$cali_optimism)
+  ) |>
   relocate(n, .after = subgroup_level)
 
-write.csv2(performance_subgroup_combined, file = 'results/1ym/model_training/final_performance/combined_subgroup_analyses.csv')
+make_ci_strings <- function(df,
+                            sets = c("apparent", "optimism_adjusted"),
+                            digits = 3,
+                            id_cols = c("subgroup_var", "subgroup_level"),
+                            out_suffix = "fmt",
+                            drop_original = TRUE) {
+  
+  out_cols <- character()
+  
+  for (s in sets) {
+    est_cols <- names(df) |> str_subset(paste0("_", s, "$"))
+    
+    metrics <- est_cols |>
+      str_remove(paste0("_", s, "$")) |>
+      keep(~ paste0(.x, "_lo_", s) %in% names(df) && paste0(.x, "_hi_", s) %in% names(df))
+    
+    for (m in metrics) {
+      est <- paste0(m, "_", s)
+      lo  <- paste0(m, "_lo_", s)
+      hi  <- paste0(m, "_hi_", s)
+      
+      out <- paste0(m, "_", s, "_", out_suffix)
+      out_cols <- c(out_cols, out)
+      
+      fmt <- paste0("%.", digits, "f (%.", digits, "f-%.", digits, "f)")
+      df[[out]] <- sprintf(
+        fmt,
+        as.numeric(df[[est]]),
+        as.numeric(df[[lo]]),
+        as.numeric(df[[hi]])
+      )
+    }
+  }
+  
+  if (!drop_original) return(df)
+  
+  keep_cols <- c(id_cols, out_cols)
+  keep_cols <- keep_cols[keep_cols %in% names(df)]
+  
+  df |> select(all_of(keep_cols))
+}
+
+subgroup_results_export <- make_ci_strings(subgroup_results,sets = c("apparent", "optimism_adjusted"),
+                                           digits = 3,
+                                           id_cols = c("subgroup_var", "subgroup_level"),
+                                           out_suffix = "pretty",
+                                           drop_original = TRUE
+)
+
+write.csv2(subgroup_results, file = 'results/1ym/model_training/final_performance/combined_subgroup_analyses.csv')
+write.csv2(subgroup_results_export, file = 'results/1ym/model_training/final_performance/combined_subgroup_analyses_export.csv')
+
